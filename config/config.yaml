@@ -1,0 +1,10 @@
+serial:
+  port: /dev/ttyUSB0
+  baudrate: 9600
+img:
+  hsv:
+    lower: [0, 100, 100]
+    upper: [10, 255, 255]
+  area:
+    min: 10
+    max: 100
