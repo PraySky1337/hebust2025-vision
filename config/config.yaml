@@ -1,6 +1,13 @@
 serial:
   port: /dev/ttyUSB0
   baudrate: 9600
+camera:
+  width: 640
+  height: 480
+  fps: 60
+  exposure: -1
+# 以上为冷加载
+# 以下为热加载
 img:
   hsv:
     lower: [0, 100, 100]

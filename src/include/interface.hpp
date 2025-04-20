@@ -2,7 +2,9 @@
 
 #include <cstdint>
 
-namespace at{
+namespace at {
+
+enum class LogLevel { INFO = 0, WARN, ERROR, DEBUG};
 
 enum class IdentScheme {
   HSV,

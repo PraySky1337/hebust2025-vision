@@ -1,6 +1,10 @@
 #pragma once
 #include <concepts>
 #include <cstring>
+#include <unistd.h>
+#include <string>
+#include <limits.h>
+
 
 #include "interface.hpp"
 
@@ -53,5 +57,23 @@ inline void deserialize(const uint8_t * buffer, SendPacket & data)
   std::memcpy(&data, buffer, sizeof(SendPacket));
 }
 
+inline std::string getExecutablePath() {
+  char path[PATH_MAX] = {0};
+  ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
+  if (len != -1) {
+    path[len] = '\0';
+    return std::string(path);
+  }
+  return "";
+}
+
+inline std::string getExecutableDir() {
+  std::string fullPath = getExecutablePath();
+  size_t pos = fullPath.find_last_of('/');
+  if (pos != std::string::npos) {
+    return fullPath.substr(0, pos);
+  }
+  return "";
+}
 
 }  // namespace at

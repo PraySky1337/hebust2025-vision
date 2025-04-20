@@ -1,26 +1,37 @@
+#include "core.hpp"
+
 #include <fcntl.h>
+#include <termios.h>
+
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <stdexcept>
-#include <string>
-
 #include <opencv2/highgui.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
-#include "core.hpp"
-#include "include/param.hpp"
 #include "interface.hpp"
 #include "kalman_filter.hpp"
+#include "param.hpp"
 #include "serial_port.hpp"
+#include "util/fps_counter.hpp"
+#include "util/keyboard_listener.hpp"
 #include "util/logger.hpp"
 #include "util/util_func.hpp"
 
 namespace at
 {
-Core::Core(bool is_debug) : is_debug_(is_debug)
+Core::Core(bool is_debug)
+: is_debug_(is_debug),
+  capture_fpsc("capture"),
+  process_fpsc("process")
 {
+  FPSCounter::enable(is_debug_);
   auto & sm = state_machine_;
   sm.add_transition(STATE_IDLE, EVENT_START_IMU, STATE_IMU_RUNNING);
   sm.add_transition(STATE_IDLE, EVENT_START_VISION, STATE_VISION_RUNNING);
@@ -41,15 +52,21 @@ Core::Core(bool is_debug) : is_debug_(is_debug)
   this->setup_state_action();
 
   sm.set_initial_state(STATE_IDLE);
+
 }
 Core::~Core()
 {
   if (this->stop()) {
     capture_thread_.reset();
     process_thread_.reset();
-    LOG_INFO << "core end";
+    LOG_INFO << "core end" << std::endl;
+    if (is_debug_) {
+      auto status = FPSCounter::getAllStats();
+      LOG_DEBUG << "Process Status: \n" << status.at("process") << std::endl;
+      LOG_DEBUG << "Capture Status: \n" << status.at("capture") << std::endl;
+    }
   } else {
-    LOG_ERROR << "core destruct error";
+    LOG_ERROR << "core destruct error" << std::endl;
   }
 }
 void Core::setup_state_action()
@@ -58,6 +75,7 @@ void Core::setup_state_action()
   sm.set_on_enter(STATE_IDLE, [this]() {
     LOG_INFO << "Current state: IDLE" << std::endl;
     vision_running_.store(false);
+    print_menu();
   });
 
   sm.set_on_enter(STATE_QUIT, [this]() {
@@ -69,24 +87,44 @@ void Core::setup_state_action()
 
   sm.set_on_enter(STATE_ERROR, [this]() {
     LOG_ERROR << "Current state: ERROR" << std::endl;
-    stop();
-    throw std::runtime_error("State Error");
-    vision_running_.store(false);
-    main_running_.store(false);
+    state_machine_.handle_event(EVENT_QUIT);
   });
 
   sm.set_on_enter(STATE_IMU_RUNNING, [this]() {
     LOG_INFO << "Current state: IMU_RUNNING" << std::endl;
-    vision_running_.store(true);
     send_packet.mode = 0;
+    vision_running_.store(true);
+    cv.notify_all();
   });
 
   sm.set_on_enter(STATE_VISION_RUNNING, [this]() {
     LOG_INFO << "Current state: VISION_RUNNING" << std::endl;
-    vision_running_.store(true);
     send_packet.mode = 1;
+    vision_running_.store(true);
+    cv.notify_all();
   });
+}
 
+void Core::setup_camera_opts()
+{
+  std::ostringstream oss;
+  if (!cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640)) {
+    oss << "Failed to set FRAME_WIDTH, current value is : "
+        << cap_.get(cv::CAP_PROP_FRAME_WIDTH) << "\n";
+  }
+  if (!cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480)) {
+    oss << "Failed to set FRAME_HEIGHT, current value is : "
+        << cap_.get(cv::CAP_PROP_FRAME_HEIGHT) << "\n";
+  }
+  if (!cap_.set(cv::CAP_PROP_FPS, 60)) {
+    oss << "Failed to set FPS, current value is : "
+        << cap_.get(cv::CAP_PROP_FPS) << "\n";
+  }
+  if (!cap_.set(cv::CAP_PROP_EXPOSURE, -4)) {
+    oss << "Failed to set EXPOSURE, current value is : "
+        << cap_.get(cv::CAP_PROP_EXPOSURE);
+  }
+  if (!oss.str().empty()) LOG_ERROR << oss.str() << std::endl;
 }
 
 void Core::start(int device_id)
@@ -98,6 +136,7 @@ void Core::start(int device_id)
     LOG_ERROR << err << std::endl;
     throw std::runtime_error(err.c_str());
   } else {
+    this->setup_camera_opts();
     LOG_INFO << "camera opened successfully" << std::endl;
   }
   if (!s.open(p.serial.device_path, p.serial.baudrate)) {
@@ -116,13 +155,12 @@ void Core::start(int device_id)
     std::make_unique<std::thread>(&Core::process_thread_func, this);
 
   main_running_.store(true);
-  int key = -1;
   bool input_angle = false;
   float angle = 0.0f;
   uint8_t buffer[128];
+  at::Keyboard keyb;
 
   while (main_running_) {
-    auto& s = SerialPort::getInstance();
     {
       std::shared_lock lock(packet_mutex);
       serialize(send_packet, buffer);
@@ -130,13 +168,16 @@ void Core::start(int device_id)
     if (s.write(buffer, sizeof(buffer)) < 0) {
       LOG_ERROR << "数据发送失败" << std::endl;
     }
+    int key = keyb.get_char();
     if (input_angle) {
       if (key >= '0' && key <= '9') {
         angle = angle * 10 + (key - '0');
         LOG_INFO << "angle: " << angle << std::endl;
+      } else if (key == 'q') {
+        state_machine_.handle_event(EVENT_QUIT);
       } else if (key == 13) {  // enter
-        if (angle <= 45.0f || angle >= 145.0f) {
-          LOG_WARN << "overclaim angle" << angle << std::endl;
+        if (angle < 60.0f || angle > 120.0f) {
+          LOG_WARN << "overclaim angle: " << angle << std::endl;
           angle = 90.0f;
         }
         LOG_INFO << "Final expected angle: " << angle << std::endl;
@@ -149,8 +190,8 @@ void Core::start(int device_id)
         state_machine_.handle_event(EVENT_STOP);
         break;
       case 's': case 'S':
-        // 树莓派 3b 是 四核心
-        // 本来想用协程，但只能如此架构。
+        LOG_INFO << "please input expected angle: " << std::endl;
+        angle = 0.0f;
         input_angle = true;
         break;
       case 'i': case 'I':
@@ -169,80 +210,72 @@ void Core::start(int device_id)
 
 bool Core::stop()
 {
-  if (!main_running_.load()) {
-    LOG_WARN << "Core is already stopped" << std::endl;
-    return false;
-  }
-  vision_running_.store(false);
   main_running_.store(false);
-  bool ret = true;
+  vision_running_.store(false);
+  cv.notify_all();
   if (capture_thread_->joinable()) {
     capture_thread_->join();
-    ret = false;
-  } else {
-    LOG_WARN << "video capture thread cannot join" << std::endl;
   }
   if (process_thread_->joinable()) {
     process_thread_->join();
-    ret = false;
-    LOG_WARN << "video process thread cannot join" << std::endl;
   }
   {
     cv::Mat temp;  // 清空队列
-    while (frame_queue_.pop(temp)) {}
+    while (frame_queue_.pop(temp)) {
+    }
   }
-  return ret;
+  return true;
 }
 
 void Core::capture_thread_func()
 {
   cv::Mat frame;
-BACK:
-  while (vision_running_) {
-    if (!cap_.isOpened()) [[unlikely]] {
-      LOG_ERROR << "camera offline" << std::endl;
-      break;
+  while (main_running_) {
+    {
+      std::unique_lock<std::mutex> lock(cv_mtx);
+      cv.wait(
+        lock, [this] { return !main_running_ || vision_running_.load(); });
     }
+    while (vision_running_) {
+      capture_fpsc++;
+      if (!cap_.isOpened()) [[unlikely]] {
+        LOG_ERROR << "camera offline" << std::endl;
+        state_machine_.handle_event(EVENT_QUIT);
+        break;
+      }
 
-    if (!cap_.read(frame)) [[unlikely]] {
-      LOG_WARN << "failed to read frame" << std::endl;
-      continue;
-    }
+      if (!cap_.read(frame)) [[unlikely]] {
+        LOG_WARN << "failed to read frame" << std::endl;
+        continue;
+      }
 
-    if (!frame.empty()) [[likely]] {
-      frame_queue_.push(frame);
+      if (!frame.empty()) [[likely]] {
+        frame_queue_.push(frame);
+      }
     }
-  }
-  if (
-    state_machine_.get_state() != STATE_ERROR &&
-    state_machine_.get_state() != STATE_QUIT) {
-    goto BACK;
-  } else {
-    return;
   }
 }
 
 void Core::process_thread_func()
 {
   cv::Mat frame;
-BACK:
-  while (vision_running_) {
-    if (frame_queue_.waitAndPop(frame)) {
-      if (!detect(frame, IdentScheme::HSV)) {
-        continue;
+  while (main_running_) {
+    {
+      std::unique_lock<std::mutex> lock(cv_mtx);
+      cv.wait(
+        lock, [this] { return !main_running_ || vision_running_.load(); });
+    }
+    while (vision_running_.load()) {
+      process_fpsc++;
+      if (frame_queue_.waitAndPop(frame)) {
+        if (!detect(frame, IdentScheme::HSV)) {
+          continue;
+        }
+      } else {
+        LOG_WARN << "frame queue is empty" << std::endl;
       }
-    } else {
-      LOG_WARN << "frame queue is empty";
     }
   };
-
-  if (
-    state_machine_.get_state() != STATE_ERROR &&
-    state_machine_.get_state() != STATE_QUIT) {
-    goto BACK;
-  } else {
-    return;
-  }
 }
 
 bool Core::detect(cv::Mat & input_img, IdentScheme is)
@@ -285,7 +318,7 @@ float Core::hsv_detect(cv::Mat & rgb_img)
   vector<vector<cv::Point>> contours;
   cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
   if (contours.empty()) {
-    LOG_INFO << "contours is empty";
+    LOG_INFO << "contours is empty" << std::endl;
     return false;
   }
   std::vector<cv::Rect> results;
@@ -324,6 +357,24 @@ float Core::calculate_angle(const cv::Rect & rect_1, const cv::Rect & rect_2)
   }
   auto vec = center_up - center_down;
   return std::atan2(vec.y, vec.x) * 180.0f / CV_PI;
+}
+
+void Core::print_menu()
+{
+  std::cout << std::endl;
+  std::cout << "┌───────────── 菜单 ─────────────┐\n";
+  std::cout << "│ " << std::left << std::setw(5) << "v"
+            << "│ 启动视觉模块            │\n";
+  std::cout << "│ " << std::left << std::setw(5) << "i"
+            << "│ 启动 IMU 模块           │\n";
+  std::cout << "│ " << std::left << std::setw(5) << "s"
+            << "│ 设置目标角度            │\n";
+  std::cout << "│ " << std::left << std::setw(5) << "esc"
+            << "│ 停止                    │\n";
+  std::cout << "│ " << std::left << std::setw(5) << "q"
+            << "│ 退出程序                │\n";
+  std::cout << "└────────────────────────────────┘\n";
+  std::cout << "请选择操作编号: " << std::endl;
 }
 
 }  // namespace at

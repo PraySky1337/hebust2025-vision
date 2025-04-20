@@ -1,5 +1,7 @@
 #pragma once
 #include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <opencv2/video/tracking.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv4/opencv2/opencv.hpp>
@@ -10,6 +12,7 @@
 #include "kalman_filter.hpp"
 #include "util/safe_queue.hpp"
 #include "util/state_machine.hpp"
+#include "util/fps_counter.hpp"
 
 namespace at
 {
@@ -43,11 +46,13 @@ public:
 private:
   bool detect(cv::Mat & img, IdentScheme is);
   void setup_state_action();
+  void setup_camera_opts();
   float hsv_detect(cv::Mat & img);
   float weighing_detect(cv::Mat & img);
   float calculate_angle(const cv::Rect & rect_1, const cv::Rect & rect_2);
   void capture_thread_func();
   void process_thread_func();
+  void print_menu();
 
   bool is_debug_;
   StateMachine<State, Event> state_machine_;
@@ -55,11 +60,14 @@ private:
   std::atomic<bool> main_running_{false};
   SendPacket send_packet;
   std::shared_mutex packet_mutex;
+  std::mutex cv_mtx;
+  std::condition_variable cv;
   cv::VideoCapture cap_;
   AngleKalmanFilter angle_kf_;
   SafeQueue<cv::Mat> frame_queue_;
   std::unique_ptr<std::thread> capture_thread_;
   std::unique_ptr<std::thread> process_thread_;
+  FPSCounter capture_fpsc;
+  FPSCounter process_fpsc;
 };
-
 }  // namespace at

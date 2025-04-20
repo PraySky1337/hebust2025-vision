@@ -42,9 +42,10 @@ public:
       m_yaml_root = std::make_unique<YAML::Node>();
       *m_yaml_root = YAML::LoadFile(m_config_path / "config.yaml");
       load_config();
+      update_config();
       if (m_is_debug) {
         m_config_monitor = std::make_unique<at::FileMonitor>(
-          m_config_path / "config.yaml", [this]() { this->load_config(); });
+          m_config_path / "config.yaml", [this]() { this->update_config(); });
       }
     } catch (const std::exception & e) {
       LOG_ERROR << "YAML error:" << e.what();
@@ -57,6 +58,13 @@ public:
     int baudrate;
     fs::path device_path;
   } serial;
+  struct CameraP
+  {
+    int width;
+    int height;
+    int fps;
+    int exposure;
+  } camera;
   struct ImgProcP
   {
     IdentScheme ident_scheme;
@@ -67,12 +75,9 @@ public:
   } img_proc;
 
 private:
-  void load_config()
+  void update_config()
   {
     auto & root = *m_yaml_root;
-    // serial
-    serial.device_path = root["serial"]["port"].as<std::string>("/dev/ttyACM0");
-    serial.baudrate = root["serial"]["baudrate"].as<int>(9600);
     // img
     auto hsv_lower = root["img"]["hsv"]["lower"];
     auto hsv_upper = root["img"]["hsv"]["upper"];
@@ -87,6 +92,18 @@ private:
 
     img_proc.min_area = root["img"]["area"]["min"].as<int>(10);
     img_proc.max_area = root["img"]["area"]["max"].as<int>(100);
+  }
+  void load_config()
+  {
+    auto & root = *m_yaml_root;
+    // serial
+    serial.device_path = root["serial"]["port"].as<std::string>("/dev/ttyACM0");
+    serial.baudrate = root["serial"]["baudrate"].as<int>(9600);
+    // camera
+    camera.width = root["camera"]["width"].as<int>(640);
+    camera.height = root["camera"]["height"].as<int>(480);
+    camera.fps = root["camera"]["fps"].as<int>(60);
+    camera.exposure = root["camera"]["exposure"].as<int>(-1);
   };
   bool m_is_debug;
   std::unique_ptr<YAML::Node> m_yaml_root;

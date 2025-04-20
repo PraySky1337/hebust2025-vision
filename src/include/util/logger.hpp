@@ -8,17 +8,19 @@
 #include <sstream>
 #include <string>
 
+#include "interface.hpp"
 #include "singleton_base.hpp"
 
 namespace at
 {
-enum class LogLevel { INFO = 0, WARN, ERROR };
 
 class Logger : public Singleton<Logger>
 {
 public:
   friend class Singleton<Logger>;
-  Logger(const std::filesystem::path & log_path = "log.txt", LogLevel level = LogLevel::INFO)
+  Logger(
+    const std::filesystem::path & log_path = "log.txt",
+    LogLevel level = LogLevel::INFO)
   : logLevel(level)
   {
     try {
@@ -45,6 +47,9 @@ public:
 
   void setAutoFlush(bool enabled) { autoFlush = enabled; }
 
+  void setDebug(bool enabled) { debugEnabled = enabled; }
+  bool isDebugEnabled() const { return debugEnabled; }
+
   // 流式输出日志
   Logger & operator<<(LogLevel level)
   {
@@ -55,7 +60,14 @@ public:
   template <typename T>
   Logger & operator<<(const T & val)
   {
-    buffer << val;  // 移除自动添加的空格
+    // 先检查日志级别
+    if (
+      currentLevel < logLevel ||
+      (currentLevel == LogLevel::DEBUG && !debugEnabled)) {
+      return *this;
+    }
+
+    buffer << val;
     if (autoFlush) {
       flush();
     }
@@ -65,12 +77,24 @@ public:
   // 特化字符串类型
   Logger & operator<<(const std::string & val)
   {
+    if (
+      currentLevel < logLevel ||
+      (currentLevel == LogLevel::DEBUG && !debugEnabled)) {
+      return *this;
+    }
+
     buffer << val;
     return *this;
   }
 
   Logger & operator<<(const char * val)
   {
+    if (
+      currentLevel < logLevel ||
+      (currentLevel == LogLevel::DEBUG && !debugEnabled)) {
+      return *this;
+    }
+
     buffer << val;
     return *this;
   }
@@ -78,6 +102,12 @@ public:
   Logger & operator<<(std::ostream & (*endl)(std::ostream &))
   {
     (void)endl;
+    if (
+      currentLevel < logLevel ||
+      (currentLevel == LogLevel::DEBUG && !debugEnabled)) {
+      return *this;
+    }
+
     flush();
     return *this;
   }
@@ -88,23 +118,24 @@ private:
   std::ofstream logFile;
   std::mutex mtx;
   std::ostringstream buffer;
-  bool autoFlush = false;  // 默认不自动flush
+  bool autoFlush = false;     // 默认不自动flush
+  bool debugEnabled = false;  // 控制DEBUG日志的开关
 
   void flush()
   {
-    if (currentLevel < logLevel) {
-      return;
-    }
+    // 移除日志级别检查，因为已经在operator<<中检查过了
     std::lock_guard<std::mutex> lock(mtx);
 
     // 添加时间戳
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
     char timeStr[32];
-    std::strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
+    std::strftime(
+      timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
 
     std::string tag = levelToString(currentLevel);
-    std::string output = std::string(timeStr) + " [" + tag + "] " + buffer.str();
+    std::string output =
+      std::string(timeStr) + " [" + tag + "] " + buffer.str();
 
     // 移除末尾多余空格
     while (!output.empty() && output.back() == ' ') {
@@ -129,6 +160,8 @@ private:
         return "WARN";
       case LogLevel::ERROR:
         return "ERROR";
+      case LogLevel::DEBUG:
+        return "DEBUG";
       default:
         return "UNKNOWN";
     }
@@ -139,3 +172,4 @@ private:
 #define LOG_INFO (at::Logger::getInstance() << at::LogLevel::INFO)
 #define LOG_WARN (at::Logger::getInstance() << at::LogLevel::WARN)
 #define LOG_ERROR (at::Logger::getInstance() << at::LogLevel::ERROR)
+#define LOG_DEBUG (at::Logger::getInstance() << at::LogLevel::DEBUG)

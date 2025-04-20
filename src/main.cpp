@@ -7,21 +7,21 @@
 #include "param.hpp"
 #include "serial_port.hpp"
 #include "util/logger.hpp"
+#include "options.hpp"
 
-namespace
+int main(int argc, char* argv[])
 {
-namespace fs = std::filesystem;
-const fs::path source_path = "/home/sxs/Desktop/raspberry_pi/vision";
-constexpr bool is_debug = true;
-}  // namespace
-
-int main()
-{
-  at::Logger::init(source_path / "log" / "log.txt", at::LogLevel::INFO);
-  at::Param::init(source_path, is_debug);
+  at::CommandLineOptions opts;
+  opts.parse(argc, argv);
+  if (opts.show_help) {
+    return 0;
+  }
+  at::Logger::init(opts.source_path / "log" / "log.txt", opts.log_level);
+  at::Logger::getInstance().setDebug(opts.is_debug);
+  at::Param::init(opts.source_path, opts.is_debug);
   at::SerialPort::init();
 
-  at::Core core(is_debug);
+  at::Core core(opts.is_debug);
   core.start();  // call it after at::Param::init() && at::SerialPort::init() && at::Logger::init()
   at::SerialPort::getInstance().close();
   return 0;
