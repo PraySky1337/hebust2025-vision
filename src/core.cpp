@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "interface.hpp"
 #include "kalman_filter.hpp"
@@ -27,9 +28,7 @@
 namespace at
 {
 Core::Core(bool is_debug)
-: is_debug_(is_debug),
-  capture_fpsc("capture"),
-  process_fpsc("process")
+: is_debug_(is_debug), capture_fpsc("capture"), process_fpsc("process")
 {
   FPSCounter::enable(is_debug_);
   auto & sm = state_machine_;
@@ -52,7 +51,6 @@ Core::Core(bool is_debug)
   this->setup_state_action();
 
   sm.set_initial_state(STATE_IDLE);
-
 }
 Core::~Core()
 {
@@ -108,6 +106,7 @@ void Core::setup_state_action()
 void Core::setup_camera_opts()
 {
   std::ostringstream oss;
+  cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
   if (!cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640)) {
     oss << "Failed to set FRAME_WIDTH, current value is : "
         << cap_.get(cv::CAP_PROP_FRAME_WIDTH) << "\n";
@@ -115,14 +114,6 @@ void Core::setup_camera_opts()
   if (!cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480)) {
     oss << "Failed to set FRAME_HEIGHT, current value is : "
         << cap_.get(cv::CAP_PROP_FRAME_HEIGHT) << "\n";
-  }
-  if (!cap_.set(cv::CAP_PROP_FPS, 60)) {
-    oss << "Failed to set FPS, current value is : "
-        << cap_.get(cv::CAP_PROP_FPS) << "\n";
-  }
-  if (!cap_.set(cv::CAP_PROP_EXPOSURE, -4)) {
-    oss << "Failed to set EXPOSURE, current value is : "
-        << cap_.get(cv::CAP_PROP_EXPOSURE);
   }
   if (!oss.str().empty()) LOG_ERROR << oss.str() << std::endl;
 }
@@ -243,12 +234,28 @@ void Core::capture_thread_func()
         state_machine_.handle_event(EVENT_QUIT);
         break;
       }
-
-      if (!cap_.read(frame)) [[unlikely]] {
-        LOG_WARN << "failed to read frame" << std::endl;
-        continue;
+      LOG_DEBUG << "Opened: " << cap_.isOpened()
+                << ", W×H: " << cap_.get(cv::CAP_PROP_FRAME_WIDTH) << "×"
+                << cap_.get(cv::CAP_PROP_FRAME_HEIGHT)
+                << ", FPS: " << cap_.get(cv::CAP_PROP_FPS)
+                << ", FOURCC: " << int(cap_.get(cv::CAP_PROP_FOURCC))
+                << std::endl;
+      if (is_debug_) {
+        if (!cap_.grab()) {
+          LOG_WARN << "grab() failed\n";
+          continue;
+        }
+        if (!cap_.retrieve(frame)) {
+          LOG_WARN << "retrieve() failed\n";
+          continue;
+        }
+        cv::imshow("debug_raw", frame);
+        cv::waitKey(1);
+      } else {
+        if (!cap_.read(frame)) {
+          LOG_WARN << "read() failed";
+        }
       }
-
       if (!frame.empty()) [[likely]] {
         frame_queue_.push(frame);
       }
