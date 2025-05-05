@@ -9,13 +9,22 @@
 #include <thread>
 
 #include "interface.hpp"
+#include "tracker.hpp"
 #include "kalman_filter.hpp"
-#include "util/safe_queue.hpp"
-#include "util/state_machine.hpp"
 #include "util/fps_counter.hpp"
+#include "util/safe_queue.hpp"
+#include "util/slope.hpp"
+#include "util/state_machine.hpp"
+
 
 namespace at
 {
+struct LEDInfo
+{
+  cv::Point center;
+  double area;
+  std::string color;
+};
 
 class Core
 {
@@ -44,20 +53,28 @@ public:
   bool stop();
 
 private:
-  bool detect(cv::Mat & img, IdentScheme is);
+  void init(int device_id = 0);
+  cv::Mat preprocess(const cv::Mat & img);
   void setup_state_action();
   void setup_camera_opts();
-  float hsv_detect(cv::Mat & img);
-  float weighing_detect(cv::Mat & img);
-  float calculate_angle(const cv::Rect & rect_1, const cv::Rect & rect_2);
+
+  float weighing_detect(const cv::Mat & binary_img, const cv::Mat & raw_img, cv::Mat & result_img);
   void capture_thread_func();
   void process_thread_func();
+  void serial_thread_func();
   void print_menu();
+  void draw_debug_result(cv::Mat & result_img, const std::vector<cv::Point> & contours) const;
+  void draw_line_result(cv::Mat & result_img, const std::vector<cv::Point> & line, float angle_deg) const;
 
   bool is_debug_;
   StateMachine<State, Event> state_machine_;
+  DynamicRoiTracker tracker_;
+  TimeSlopeFunction slope_func_;
+  cv::Point2f current_roi_offset_;
   std::atomic<bool> vision_running_{false};
   std::atomic<bool> main_running_{false};
+  std::atomic<float> target_angle;
+  std::atomic<float> measurement_angle;
   SendPacket send_packet;
   std::shared_mutex packet_mutex;
   std::mutex cv_mtx;
@@ -67,7 +84,9 @@ private:
   SafeQueue<cv::Mat> frame_queue_;
   std::unique_ptr<std::thread> capture_thread_;
   std::unique_ptr<std::thread> process_thread_;
+  std::unique_ptr<std::thread> serial_thread_;
   FPSCounter capture_fpsc;
   FPSCounter process_fpsc;
+  FPSCounter serial_fpsc;
 };
 }  // namespace at

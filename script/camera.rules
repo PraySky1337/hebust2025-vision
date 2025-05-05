@@ -1,0 +1,2 @@
+SUBSYSTEM=="video4linux", ATTR{name}=="USB 2.0 Camera", SYMLINK+="usb_cam"
+SUBSYSTEM=="video4linux", ATTR{name}=="Integrated Webcam", SYMLINK+="int_cam"

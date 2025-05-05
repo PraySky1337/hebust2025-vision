@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <opencv2/core/types.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
@@ -15,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "interface.hpp"
 #include "kalman_filter.hpp"
@@ -28,7 +30,13 @@
 namespace at
 {
 Core::Core(bool is_debug)
-: is_debug_(is_debug), capture_fpsc("capture"), process_fpsc("process")
+: is_debug_(is_debug),
+  tracker_(
+    Param::getInstance().camera.width, Param::getInstance().camera.height),
+  capture_fpsc("capture"),
+  process_fpsc("process"),
+  serial_fpsc("serial")
+
 {
   FPSCounter::enable(is_debug_);
   auto & sm = state_machine_;
@@ -57,16 +65,58 @@ Core::~Core()
   if (this->stop()) {
     capture_thread_.reset();
     process_thread_.reset();
+    serial_thread_.reset();
     LOG_INFO << "core end" << std::endl;
     if (is_debug_) {
       auto status = FPSCounter::getAllStats();
       LOG_DEBUG << "Process Status: \n" << status.at("process") << std::endl;
       LOG_DEBUG << "Capture Status: \n" << status.at("capture") << std::endl;
+      LOG_DEBUG << "Serial Status: \n" << status.at("serial") << std::endl;
     }
+    cap_.release();
   } else {
     LOG_ERROR << "core destruct error" << std::endl;
   }
 }
+
+void Core::serial_thread_func()
+{
+  auto & s = SerialPort::getInstance();
+  auto & p = Param::getInstance();
+
+  uint8_t buffer[128];
+
+  while (main_running_.load()) {
+    {
+      std::shared_lock lock(packet_mutex);
+
+      float correction_angle =
+        angle_kf_.update(measurement_angle.load()) + p.other.led_offset;
+
+      if (!slope_func_.isFinished()) {
+        send_packet.angle = slope_func_.getValue();
+      } else {
+        send_packet.angle = correction_angle;
+      }
+
+      send_packet.angular_v = angle_kf_.getVelocity();
+
+      if (is_debug_) {
+        print(send_packet);
+      }
+
+      serialize(send_packet, buffer);
+    }
+
+    ssize_t sent = s.write(buffer, sizeof(buffer));
+    if (sent < 0) {
+      LOG_ERROR << "数据发送失败";
+    }
+
+    serial_fpsc++;
+  }
+}
+
 void Core::setup_state_action()
 {
   auto & sm = state_machine_;
@@ -105,20 +155,19 @@ void Core::setup_state_action()
 
 void Core::setup_camera_opts()
 {
-  std::ostringstream oss;
+  auto & c = Param::getInstance().camera;
   cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-  if (!cap_.set(cv::CAP_PROP_FRAME_WIDTH, 640)) {
-    oss << "Failed to set FRAME_WIDTH, current value is : "
-        << cap_.get(cv::CAP_PROP_FRAME_WIDTH) << "\n";
-  }
-  if (!cap_.set(cv::CAP_PROP_FRAME_HEIGHT, 480)) {
-    oss << "Failed to set FRAME_HEIGHT, current value is : "
-        << cap_.get(cv::CAP_PROP_FRAME_HEIGHT) << "\n";
-  }
-  if (!oss.str().empty()) LOG_ERROR << oss.str() << std::endl;
+  cap_.set(cv::CAP_PROP_FRAME_WIDTH, c.width);
+  cap_.set(cv::CAP_PROP_FRAME_HEIGHT, c.height);
+  cap_.set(cv::CAP_PROP_AUTO_EXPOSURE, 1);  // 部分系统中：1 表示手动模式
+  cap_.set(cv::CAP_PROP_EXPOSURE, c.exposure);  // 曝光值，单位和范围依驱动而异
+  cap_.set(cv::CAP_PROP_GAIN, c.gain);
+  cap_.set(cv::CAP_PROP_AUTO_WB, 0);  // 关闭自动白平衡
+  cap_.set(cv::CAP_PROP_WB_TEMPERATURE, c.wb_temprature);  // 色温（若支持）
+  cap_.set(cv::CAP_PROP_FPS, 30);  // 不一定生效，但可保留
 }
 
-void Core::start(int device_id)
+void Core::init(int device_id)
 {
   auto & s = SerialPort::getInstance();
   auto & p = Param::getInstance();
@@ -137,6 +186,11 @@ void Core::start(int device_id)
     throw std::runtime_error(err.c_str());
   } else {
     LOG_INFO << "serial port opened successfully" << std::endl;
+    LOG_INFO << "Opened: " << cap_.isOpened()
+             << ", W×H: " << cap_.get(cv::CAP_PROP_FRAME_WIDTH) << "×"
+             << cap_.get(cv::CAP_PROP_FRAME_HEIGHT)
+             << ", FPS: " << cap_.get(cv::CAP_PROP_FPS)
+             << ", FOURCC: " << int(cap_.get(cv::CAP_PROP_FOURCC)) << std::endl;
   }
 
   vision_running_.store(false);
@@ -144,21 +198,21 @@ void Core::start(int device_id)
     std::make_unique<std::thread>(&Core::capture_thread_func, this);
   process_thread_ =
     std::make_unique<std::thread>(&Core::process_thread_func, this);
+  serial_thread_ =
+    std::make_unique<std::thread>(&Core::serial_thread_func, this);
+}
+
+void Core::start(int device_id)
+{
+  auto & p = Param::getInstance();
+  init(device_id);
 
   main_running_.store(true);
   bool input_angle = false;
   float angle = 0.0f;
-  uint8_t buffer[128];
   at::Keyboard keyb;
 
   while (main_running_) {
-    {
-      std::shared_lock lock(packet_mutex);
-      serialize(send_packet, buffer);
-    }
-    if (s.write(buffer, sizeof(buffer)) < 0) {
-      LOG_ERROR << "数据发送失败" << std::endl;
-    }
     int key = keyb.get_char();
     if (input_angle) {
       if (key >= '0' && key <= '9') {
@@ -170,6 +224,13 @@ void Core::start(int device_id)
         if (angle < 60.0f || angle > 120.0f) {
           LOG_WARN << "overclaim angle: " << angle << std::endl;
           angle = 90.0f;
+        }
+        {
+          std::lock_guard lk(packet_mutex);
+          send_packet.expected_angle = angle;
+          slope_func_.refresh(
+            p.other.slope_duration_time, send_packet.angle,
+            send_packet.expected_angle);
         }
         LOG_INFO << "Final expected angle: " << angle << std::endl;
         input_angle = false;
@@ -210,10 +271,8 @@ bool Core::stop()
   if (process_thread_->joinable()) {
     process_thread_->join();
   }
-  {
-    cv::Mat temp;  // 清空队列
-    while (frame_queue_.pop(temp)) {
-    }
+  if (serial_thread_->joinable()) {
+    serial_thread_->join();
   }
   return true;
 }
@@ -234,12 +293,6 @@ void Core::capture_thread_func()
         state_machine_.handle_event(EVENT_QUIT);
         break;
       }
-      LOG_DEBUG << "Opened: " << cap_.isOpened()
-                << ", W×H: " << cap_.get(cv::CAP_PROP_FRAME_WIDTH) << "×"
-                << cap_.get(cv::CAP_PROP_FRAME_HEIGHT)
-                << ", FPS: " << cap_.get(cv::CAP_PROP_FPS)
-                << ", FOURCC: " << int(cap_.get(cv::CAP_PROP_FOURCC))
-                << std::endl;
       if (is_debug_) {
         if (!cap_.grab()) {
           LOG_WARN << "grab() failed\n";
@@ -249,8 +302,6 @@ void Core::capture_thread_func()
           LOG_WARN << "retrieve() failed\n";
           continue;
         }
-        cv::imshow("debug_raw", frame);
-        cv::waitKey(1);
       } else {
         if (!cap_.read(frame)) {
           LOG_WARN << "read() failed";
@@ -265,7 +316,7 @@ void Core::capture_thread_func()
 
 void Core::process_thread_func()
 {
-  cv::Mat frame;
+  cv::Mat img_raw, binary_img, result_img;
   while (main_running_) {
     {
       std::unique_lock<std::mutex> lock(cv_mtx);
@@ -274,9 +325,15 @@ void Core::process_thread_func()
     }
     while (vision_running_.load()) {
       process_fpsc++;
-      if (frame_queue_.waitAndPop(frame)) {
-        if (!detect(frame, IdentScheme::HSV)) {
-          continue;
+      if (frame_queue_.waitAndPop(img_raw)) {
+        binary_img = preprocess(img_raw);
+        measurement_angle.store(
+          weighing_detect(binary_img, img_raw, result_img));
+        if (is_debug_) {
+          cv::imshow("img_raw", img_raw);
+          cv::imshow("binary", binary_img);
+          cv::imshow("result", result_img);
+          cv::waitKey(1);
         }
       } else {
         LOG_WARN << "frame queue is empty" << std::endl;
@@ -285,85 +342,123 @@ void Core::process_thread_func()
   };
 }
 
-bool Core::detect(cv::Mat & input_img, IdentScheme is)
+cv::Mat Core::preprocess(const cv::Mat & input_img)
 {
-  float raw_angle;
-  if (is == IdentScheme::HSV) {
-    raw_angle = hsv_detect(input_img);
-  } else if (is == IdentScheme::Weighing) {
-    raw_angle = weighing_detect(input_img);
-  } else {
-    throw std::runtime_error("Unknown input IdentScheme");
-  }
-  if (raw_angle == 0xFFFF) {
-    return false;
-  } else if (!inRange(raw_angle, -180.0f, 180.0f)) {
-    LOG_ERROR << "angle invalid";
-    return false;
-  } else {
-    float ripe_angle = angle_kf_.update(raw_angle);
-    float angular_v = angle_kf_.getVelocity();
-    {
-      std::unique_lock lock(packet_mutex);
-      send_packet.angle = ripe_angle;
-      send_packet.angular_v = angular_v;
-    }
-    return true;
-  }
+  auto & p = Param::getInstance();
+  cv::Rect roi = tracker_.getRoi(p.img_proc.roi_ratio);
+
+  cv::Mat cropped = input_img(roi);
+  cv::Mat denoised, gray, binary;
+
+  cv::GaussianBlur(cropped, denoised, cv::Size(3, 3), 0);
+  cv::cvtColor(denoised, gray, cv::COLOR_BGR2GRAY);
+  cv::threshold(gray, binary, p.img_proc.bin_thres, 255, cv::THRESH_BINARY);
+
+  // 记录当前ROI左上角偏移，供后续坐标恢复
+  current_roi_offset_ = roi.tl();
+
+  return binary;
 }
 
-float Core::hsv_detect(cv::Mat & rgb_img)
+float Core::weighing_detect(
+  const cv::Mat & binary_img, const cv::Mat & raw_img, cv::Mat & result_img)
 {
-  using std::vector;
   auto & p = Param::getInstance().img_proc;
-  cv::Mat hsv;
-  cv::cvtColor(rgb_img, hsv, cv::COLOR_BGR2HSV);
-  cv::Scalar low{p.lower_h, p.lower_s, p.lower_v};
-  cv::Scalar upper{p.upper_h, p.upper_s, p.upper_v};
-  cv::Mat mask;
-  cv::inRange(hsv, low, upper, mask);
-  vector<vector<cv::Point>> contours;
-  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-  if (contours.empty()) {
-    LOG_INFO << "contours is empty" << std::endl;
-    return false;
+
+  const cv::Point2f & roi_offset = current_roi_offset_;
+  const cv::Rect roi_rect = tracker_.getRoi(p.roi_ratio);  // 实时获取
+
+  if (is_debug_) {
+    result_img = raw_img.clone();
+    cv::rectangle(result_img, roi_rect, cv::Scalar(255, 0, 255), 2);
+  } else {
+    result_img = cv::Mat();
   }
-  std::vector<cv::Rect> results;
+
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(
+    binary_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+  std::vector<cv::Point2f> target_pair;
   for (const auto & contour : contours) {
-    cv::Rect bbox = cv::boundingRect(contour);
-    if (bbox.area() < 8 || !inRange(bbox.area(), p.min_area, p.max_area))
-      continue;
-    cv::Mat roi = hsv(bbox);
-    vector<cv::Mat> hsv_channels;
-    cv::split(roi, hsv_channels);
-    double mean_v = cv::mean(hsv_channels[2])[0];
-    if (mean_v > 180) {
-      results.push_back(bbox);
+    double area = cv::contourArea(contour);
+    if (area < p.min_area || area > p.max_area) continue;
+
+    cv::Moments mu = cv::moments(contour);
+    if (mu.m00 == 0) continue;
+
+    cv::Point2f center(mu.m10 / mu.m00, mu.m01 / mu.m00);
+    center += roi_offset;  // 坐标映射回全图
+    target_pair.emplace_back(center);
+
+    if (is_debug_) {
+      std::vector<cv::Point> shifted;
+      for (const auto & pt : contour)
+        shifted.emplace_back((cv::Point2f)pt + roi_offset);
+      draw_debug_result(result_img, shifted);
     }
   }
-  if (results.size() == 2) {
-    return calculate_angle(results[0], results[1]);
-  } else {
-    LOG_INFO << "Failed detected, results num:" << results.size() << std::endl;
-    return 0xFFFF;
+
+  if (target_pair.size() != 2) {
+    tracker_.miss();
+    LOG_INFO << "No matched led found" << std::endl;
+    return -1;
+  }
+
+  tracker_.updatePoints(target_pair[0], target_pair[1]);
+
+  double angle_rad = std::atan2(
+    target_pair[0].y - target_pair[1].y, target_pair[0].x - target_pair[1].x);
+  double angle_deg = angle_rad * 180.0 / CV_PI;
+
+  if (is_debug_) {
+    draw_line_result(
+      result_img, {cv::Point(target_pair[0]), cv::Point(target_pair[1])},
+      angle_deg);
+  }
+
+  return angle_deg;
+}
+
+void Core::draw_debug_result(
+  cv::Mat & result_img, const std::vector<cv::Point> & contour) const
+{
+  // 绘制轮廓线
+  cv::drawContours(
+    result_img, std::vector<std::vector<cv::Point>>{contour}, -1,
+    cv::Scalar(0, 255, 255), 3);
+
+  // 绘制面积值
+  cv::Moments m = cv::moments(contour);
+  if (m.m00 > 0) {
+    cv::Point center(m.m10 / m.m00, m.m01 / m.m00);
+    std::string text =
+      std::to_string(static_cast<int>(cv::contourArea(contour)));
+    cv::putText(
+      result_img, text, center, cv::FONT_HERSHEY_PLAIN, 1.0,
+      cv::Scalar(0, 255, 0), 2);
   }
 }
 
-float Core::weighing_detect(cv::Mat & img)
+void Core::draw_line_result(
+  cv::Mat & result_img, const std::vector<cv::Point> & pair_line,
+  float angle_deg) const
 {
-  (void)img;
-  return true;
-}
-
-float Core::calculate_angle(const cv::Rect & rect_1, const cv::Rect & rect_2)
-{
-  auto center_down = (rect_1.tl() + rect_1.br()) * 0.5;
-  auto center_up = (rect_2.tl() + rect_2.br()) * 0.5;
-  if (center_down.y < center_up.y) {
-    std::swap(center_down, center_up);
+  if (result_img.empty() || pair_line.size() != 2) {
+    LOG_WARN << "input draw_line_result() parameter error!" << std::endl;
+    return;
   }
-  auto vec = center_up - center_down;
-  return std::atan2(vec.y, vec.x) * 180.0f / CV_PI;
+  cv::line(result_img, pair_line.at(1), pair_line.at(0), cv::Scalar(0, 255, 0));
+
+  // 计算中点
+  cv::Point mid_pt = (pair_line[0] + pair_line[1]) * 0.5;
+
+  // 绘制角度文字
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%.1f°", angle_deg);
+  cv::putText(
+    result_img, buf, mid_pt, cv::FONT_HERSHEY_SIMPLEX, 0.5,
+    cv::Scalar(255, 0, 0), 1);
 }
 
 void Core::print_menu()

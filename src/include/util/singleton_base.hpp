@@ -14,8 +14,6 @@ public:
       std::is_constructible_v<T, Args &&...>,
       "Derived cannot be constructed with the provided arguments.");
 
-    [[maybe_unused]] auto _ = std::make_unique<T>(std::forward<Args>(args)...);
-
     std::call_once(init_flag_, [args = std::make_tuple(std::forward<Args>(args)...)]() mutable {
       instance_.reset(nullptr);  // 防止重复调用时抛异常
       std::apply(

@@ -1,69 +1,138 @@
 #pragma once
+
+#include <sys/epoll.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+
 #include <atomic>
-#include <filesystem>
 #include <functional>
-#include <memory>
+#include <map>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "logger.hpp"
 
-namespace at
-{
-namespace fs = std::filesystem;
-
-class FileMonitor
+class FileEventMonitor
 {
 public:
-  FileMonitor(const fs::path & file_path, std::function<void()> callback)
-  : file_path_(file_path), callback_(callback), running_(false)
-  {
-  }
+  FileEventMonitor() : inotify_fd_(-1), epoll_fd_(-1), running_(false) {}
 
-  ~FileMonitor() { stop(); }
+  ~FileEventMonitor() { stop(); }
 
   bool start()
   {
-    if (!fs::exists(file_path_)) {
-      LOG_ERROR << "File path: " << file_path_ << " not exist";
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_) return true;
+
+    inotify_fd_ = inotify_init1(IN_NONBLOCK);
+    if (inotify_fd_ < 0) {
+      LOG_ERROR << "Failed to init inotify" << std::endl;
       return false;
     }
 
-    running_.store(true);
-    monitor_thread_ = std::make_unique<std::thread>([this]() {
-      fs::file_time_type last_write_time = fs::last_write_time(file_path_);
+    epoll_fd_ = epoll_create1(0);
+    if (epoll_fd_ < 0) {
+      LOG_ERROR << "Failed to init epoll" << std::endl;
+      close(inotify_fd_);
+      return false;
+    }
 
-      while (running_) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        try {
-          auto new_write_time = fs::last_write_time(file_path_);
-          if (new_write_time != last_write_time) {
-            LOG_INFO << "File modified: " << file_path_;
-            callback_();
-            last_write_time = new_write_time;
-          }
-        } catch (const std::exception & e) {
-          LOG_ERROR << "Monitor error: " << e.what();
-        }
-      }
-      LOG_INFO << "File Monitor stopped: " << file_path_;
-    });
+    epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = inotify_fd_;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, inotify_fd_, &ev) < 0) {
+      LOG_ERROR << "Failed to add inotify to epoll" << std::endl;
+      close(inotify_fd_);
+      close(epoll_fd_);
+      return false;
+    }
 
+    running_ = true;
+    monitor_thread_ = std::thread([this]() { this->run(); });
+
+    LOG_INFO << "FileEventMonitor started" << std::endl;
     return true;
   }
 
   void stop()
   {
-    running_.store(false);
-    if (monitor_thread_ && monitor_thread_->joinable()) {
-      monitor_thread_->join();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_) return;
+      running_ = false;
     }
+
+    if (monitor_thread_.joinable()) {
+      monitor_thread_.join();
+    }
+
+    for (const auto & [wd, _] : callbacks_) {
+      inotify_rm_watch(inotify_fd_, wd);
+    }
+
+    close(inotify_fd_);
+    close(epoll_fd_);
+
+    LOG_INFO << "FileEventMonitor stopped" << std::endl;
+  }
+
+  bool addWatch(const std::string & path, std::function<void()> callback)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (inotify_fd_ < 0) return false;
+
+    int wd = inotify_add_watch(
+      inotify_fd_, path.c_str(), IN_CLOSE_WRITE);
+    if (wd < 0) {
+      LOG_ERROR << "Failed to watch file: " << path << std::endl;
+      return false;
+    }
+
+    callbacks_[wd] = callback;
+    LOG_INFO << "Watching file: " << path << std::endl;
+    return true;
   }
 
 private:
-  fs::path file_path_;
-  std::function<void()> callback_;
-  std::atomic<bool> running_;
-  std::unique_ptr<std::thread> monitor_thread_;
-};
+  void run()
+  {
+    constexpr int BUF_LEN = 1024 * (sizeof(inotify_event) + 16);
+    char buf[BUF_LEN];
 
-}  // namespace at
+    while (running_) {
+      epoll_event events[1];
+      int nfds = epoll_wait(epoll_fd_, events, 1, 1000);  // timeout 1s
+
+      if (nfds <= 0) continue;
+
+      int len = read(inotify_fd_, buf, BUF_LEN);
+      if (len <= 0) continue;
+
+      int i = 0;
+      while (i < len) {
+        inotify_event * event = reinterpret_cast<inotify_event *>(&buf[i]);
+
+        if (event->mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB)) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          auto it = callbacks_.find(event->wd);
+          if (it != callbacks_.end()) {
+            LOG_INFO << "File modified, triggering callback" << std::endl;
+            it->second();  // 调用回调
+          }
+        }
+
+        i += sizeof(inotify_event) + event->len;
+      }
+    }
+  }
+
+  int inotify_fd_;
+  int epoll_fd_;
+  std::atomic<bool> running_;
+  std::thread monitor_thread_;
+  std::mutex mutex_;
+
+  std::map<int, std::function<void()>> callbacks_;
+};

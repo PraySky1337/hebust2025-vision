@@ -22,7 +22,7 @@ int main(int argc, char* argv[])
   at::SerialPort::init();
 
   at::Core core(opts.is_debug);
-  core.start();  // call it after at::Param::init() && at::SerialPort::init() && at::Logger::init()
+  core.start(0);  // call it after at::Param::init() && at::SerialPort::init() && at::Logger::init()
   at::SerialPort::getInstance().close();
   return 0;
 }

@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <string>
 #include <limits.h>
+#include <opencv2/opencv.hpp>
+#include <cmath>
 
 
 #include "interface.hpp"
@@ -75,5 +77,51 @@ inline std::string getExecutableDir() {
   }
   return "";
 }
+
+
+inline std::string JudgeColor(const cv::Mat& image, const cv::Point& center, bool use_ring_sample = true) {
+    cv::Vec3f color_sum(0, 0, 0);
+
+    if (use_ring_sample) {
+        int radius = 3;
+        int count = 0;
+
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                float dist = std::sqrt(dx * dx + dy * dy);
+                if (dist > radius - 1 && dist <= radius + 1) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    if (x >= 0 && x < image.cols && y >= 0 && y < image.rows) {
+                        color_sum += image.at<cv::Vec3b>(y, x);
+                        count++;
+                    }
+                }
+            }
+        }
+
+        if (count == 0) return "unknown";
+
+        color_sum /= count;
+    } else {
+        if (center.x < 0 || center.x >= image.cols || center.y < 0 || center.y >= image.rows)
+            return "unknown";
+
+        cv::Vec3b color = image.at<cv::Vec3b>(center.y, center.x);
+        color_sum = cv::Vec3f(color[0], color[1], color[2]);
+    }
+
+    float B = color_sum[0];
+    float G = color_sum[1];
+    float R = color_sum[2];
+    (void)G;
+    if (R > 150 && R > B + 50)
+        return "red";
+    else if (B > 150 && B > R + 50)
+        return "blue";
+    else
+        return "unknown";
+}
+
 
 }  // namespace at

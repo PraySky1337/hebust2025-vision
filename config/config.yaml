@@ -1,17 +1,24 @@
 serial:
   port: /dev/ttyUSB0
-  baudrate: 9600
-camera:
-  width: 640
-  height: 480
-  fps: 60
-  exposure: -1
-# 以上为冷加载
+  baudrate: 115200
 # 以下为热加载
+camera:
+  width: 1280
+  height: 720
+  fps: 30
+  exposure: 10.
+  gain: 1.0
+  wb_temprature: 4500
 img:
   hsv:
     lower: [0, 100, 100]
     upper: [10, 255, 255]
   area:
-    min: 10
-    max: 100
+    min: 15
+    max: 170
+  threshold: 245
+  roi:
+   ratio: 2.0
+  other:
+   led_offset: 11.14
+   slope_duration_time: 5. # seconds
