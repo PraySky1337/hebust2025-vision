@@ -4,12 +4,12 @@
 #include <opencv4/opencv2/opencv.hpp>
 
 #include "core.hpp"
+#include "options.hpp"
 #include "param.hpp"
 #include "serial_port.hpp"
 #include "util/logger.hpp"
-#include "options.hpp"
 
-int main(int argc, char* argv[])
+int main(int argc, char * argv[])
 {
   at::CommandLineOptions opts;
   opts.parse(argc, argv);
@@ -21,8 +21,11 @@ int main(int argc, char* argv[])
   at::Param::init(opts.source_path, opts.is_debug);
   at::SerialPort::init();
 
+  auto & cam_id = at::Param::getInstance().camera.id;
+
   at::Core core(opts.is_debug);
-  core.start(0);  // call it after at::Param::init() && at::SerialPort::init() && at::Logger::init()
+  core.start(
+    cam_id);  // call it after at::Param::init() && at::SerialPort::init() && at::Logger::init()
   at::SerialPort::getInstance().close();
   return 0;
 }

@@ -14,7 +14,7 @@ public:
         kf.measurementMatrix = (cv::Mat_<float>(1, 2) <<
             1, 0);
         // 初始化状态
-        kf.statePre = (cv::Mat_<float>(2, 1) << 0, 0);
+        kf.statePre = (cv::Mat_<float>(2, 1) << 90, 0);
         // 协方差设置
         cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-3));   // Q
         cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-1)); // R

@@ -73,6 +73,7 @@ private:
   cv::Point2f current_roi_offset_;
   std::atomic<bool> vision_running_{false};
   std::atomic<bool> main_running_{false};
+  std::atomic<bool> serial_running_{false};
   std::atomic<float> target_angle;
   std::atomic<float> measurement_angle;
   SendPacket send_packet;

@@ -3,7 +3,7 @@
 #include <fcntl.h>
 #include <termios.h>
 
-#include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <memory>
@@ -15,7 +15,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "interface.hpp"
@@ -82,38 +81,47 @@ Core::~Core()
 void Core::serial_thread_func()
 {
   auto & s = SerialPort::getInstance();
-  auto & p = Param::getInstance();
 
   uint8_t buffer[128];
-
   while (main_running_.load()) {
     {
-      std::shared_lock lock(packet_mutex);
+      std::unique_lock<std::mutex> lock(cv_mtx);
+      cv.wait(
+        lock, [this] { return !main_running_ || serial_running_.load(); });
+    }
+    while (serial_running_.load()) {
+      {
+        std::shared_lock lock(packet_mutex);
 
-      float correction_angle =
-        angle_kf_.update(measurement_angle.load()) + p.other.led_offset;
+        if (vision_running_.load()) {
+          float correction_angle = angle_kf_.update(measurement_angle.load());
 
-      if (!slope_func_.isFinished()) {
-        send_packet.angle = slope_func_.getValue();
-      } else {
-        send_packet.angle = correction_angle;
+          if (!slope_func_.isFinished()) {
+            send_packet.angle = slope_func_.getValue();
+          } else {
+            send_packet.angle = correction_angle;
+          }
+          send_packet.angular_v = angle_kf_.getVelocity();
+        } else {
+          send_packet.angle = 0.f;
+          send_packet.expected_angle = 0.f;
+          send_packet.angular_v = 0.f;
+        }
+
+        if (is_debug_) {
+          print(send_packet);
+        }
+
+        serialize(send_packet, buffer);
       }
 
-      send_packet.angular_v = angle_kf_.getVelocity();
-
-      if (is_debug_) {
-        print(send_packet);
+      ssize_t sent = s.write(buffer, sizeof(buffer));
+      if (sent < 0) {
+        LOG_ERROR << "数据发送失败";
       }
 
-      serialize(send_packet, buffer);
+      serial_fpsc++;
     }
-
-    ssize_t sent = s.write(buffer, sizeof(buffer));
-    if (sent < 0) {
-      LOG_ERROR << "数据发送失败";
-    }
-
-    serial_fpsc++;
   }
 }
 
@@ -122,6 +130,7 @@ void Core::setup_state_action()
   auto & sm = state_machine_;
   sm.set_on_enter(STATE_IDLE, [this]() {
     LOG_INFO << "Current state: IDLE" << std::endl;
+    serial_running_.store(false);
     vision_running_.store(false);
     print_menu();
   });
@@ -140,14 +149,22 @@ void Core::setup_state_action()
 
   sm.set_on_enter(STATE_IMU_RUNNING, [this]() {
     LOG_INFO << "Current state: IMU_RUNNING" << std::endl;
-    send_packet.mode = 0;
-    vision_running_.store(true);
+    {
+      std::lock_guard lk(packet_mutex);
+      send_packet.mode = 0;
+    }
+    serial_running_.store(true);
+    vision_running_.store(false);
     cv.notify_all();
   });
 
   sm.set_on_enter(STATE_VISION_RUNNING, [this]() {
     LOG_INFO << "Current state: VISION_RUNNING" << std::endl;
-    send_packet.mode = 1;
+    {
+      std::lock_guard lk(packet_mutex);
+      send_packet.mode = 1;
+    }
+    serial_running_.store(true);
     vision_running_.store(true);
     cv.notify_all();
   });
@@ -280,13 +297,13 @@ bool Core::stop()
 void Core::capture_thread_func()
 {
   cv::Mat frame;
-  while (main_running_) {
+  while (main_running_.load()) {
     {
       std::unique_lock<std::mutex> lock(cv_mtx);
       cv.wait(
         lock, [this] { return !main_running_ || vision_running_.load(); });
     }
-    while (vision_running_) {
+    while (vision_running_.load()) {
       capture_fpsc++;
       if (!cap_.isOpened()) [[unlikely]] {
         LOG_ERROR << "camera offline" << std::endl;
@@ -363,10 +380,11 @@ cv::Mat Core::preprocess(const cv::Mat & input_img)
 float Core::weighing_detect(
   const cv::Mat & binary_img, const cv::Mat & raw_img, cv::Mat & result_img)
 {
-  auto & p = Param::getInstance().img_proc;
+  auto & img_p = Param::getInstance().img_proc;
+  auto & p = Param::getInstance();
 
   const cv::Point2f & roi_offset = current_roi_offset_;
-  const cv::Rect roi_rect = tracker_.getRoi(p.roi_ratio);  // 实时获取
+  const cv::Rect roi_rect = tracker_.getRoi(img_p.roi_ratio);  // 实时获取
 
   if (is_debug_) {
     result_img = raw_img.clone();
@@ -382,7 +400,7 @@ float Core::weighing_detect(
   std::vector<cv::Point2f> target_pair;
   for (const auto & contour : contours) {
     double area = cv::contourArea(contour);
-    if (area < p.min_area || area > p.max_area) continue;
+    if (area < img_p.min_area || area > img_p.max_area) continue;
 
     cv::Moments mu = cv::moments(contour);
     if (mu.m00 == 0) continue;
@@ -409,8 +427,10 @@ float Core::weighing_detect(
 
   double angle_rad = std::atan2(
     target_pair[0].y - target_pair[1].y, target_pair[0].x - target_pair[1].x);
-  double angle_deg = angle_rad * 180.0 / CV_PI;
-
+  float angle_deg = angle_rad * 180.0 / CV_PI;
+  angle_deg += p.other.led_offset;
+  angle_deg = 180.f - angle_deg;
+  angle_deg = std::clamp(angle_deg, 0.f, 180.f);
   if (is_debug_) {
     draw_line_result(
       result_img, {cv::Point(target_pair[0]), cv::Point(target_pair[1])},

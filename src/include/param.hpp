@@ -43,17 +43,15 @@ public:
       update_config();
       if (m_is_debug) {
         m_config_monitor.start();
-        m_config_monitor.addWatch(m_config_path, [this]{ this->update_config(); });
+        m_config_monitor.addWatch(
+          m_config_path, [this] { this->update_config(); });
       }
     } catch (const std::exception & e) {
       LOG_ERROR << "YAML error:" << e.what();
     }
   }
 
-  ~Param()
-  {
-    m_running.store(false);
-  }
+  ~Param() { m_running.store(false); }
   struct SerialP
   {
     int baudrate;
@@ -61,6 +59,7 @@ public:
   } serial;
   struct CameraP
   {
+    int id;
     int width;
     int height;
     int fps;
@@ -71,8 +70,6 @@ public:
   struct ImgProcP
   {
     IdentScheme ident_scheme;
-    double lower_h, lower_s, lower_v;
-    double upper_h, upper_s, upper_v;
     int min_area;
     int max_area;
     int bin_thres;
@@ -95,6 +92,7 @@ private:
     serial.device_path = root["serial"]["port"].as<std::string>("/dev/ttyUSB0");
     serial.baudrate = root["serial"]["baudrate"].as<int>(9600);
     // camera
+    camera.id = root["camera"]["id"].as<int>(1);
     camera.width = root["camera"]["width"].as<int>(1280);
     camera.height = root["camera"]["height"].as<int>(720);
     camera.fps = root["camera"]["fps"].as<int>(30);
@@ -102,17 +100,6 @@ private:
     camera.gain = root["camera"]["gain"].as<float>(1.0);
     camera.wb_temprature = root["camera"]["wb_temprature"].as<int>(3000);
     // img
-    auto hsv_lower = root["img"]["hsv"]["lower"];
-    auto hsv_upper = root["img"]["hsv"]["upper"];
-
-    img_proc.lower_h = hsv_lower[0].as<int>();
-    img_proc.lower_s = hsv_lower[1].as<int>();
-    img_proc.lower_v = hsv_lower[2].as<int>();
-
-    img_proc.upper_h = hsv_upper[0].as<int>();
-    img_proc.upper_s = hsv_upper[1].as<int>();
-    img_proc.upper_v = hsv_upper[2].as<int>();
-
     img_proc.min_area = root["img"]["area"]["min"].as<int>(15);
     img_proc.max_area = root["img"]["area"]["max"].as<int>(150);
 
@@ -120,7 +107,8 @@ private:
     img_proc.roi_ratio = root["img"]["roi"]["ratio"].as<float>(1.5);
 
     other.led_offset = root["other"]["led_offset"].as<float>(11.12);
-    other.slope_duration_time = root["other"]["slope_duration_time"].as<float>(3.f);
+    other.slope_duration_time =
+      root["other"]["slope_duration_time"].as<float>(3.f);
   };
   bool m_is_debug;
   std::unique_ptr<YAML::Node> m_yaml_root;
